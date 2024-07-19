@@ -415,6 +415,9 @@ class SaverMixin:
         imgs = sorted(imgs, key=lambda f: int(matcher.search(f).groups()[0]))
         imgs = [cv2.imread(os.path.join(img_dir, f)) for f in imgs]
 
+        # # remove dir
+        # os.rmdir(img_dir)
+
         if save_format == "gif":
             imgs = [cv2.cvtColor(i, cv2.COLOR_BGR2RGB) for i in imgs]
             imageio.mimsave(save_path, imgs, fps=fps, palettesize=256)

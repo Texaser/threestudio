@@ -1,36 +1,50 @@
-name: "latentnerf"
+name: "hifa-mtn"
 tag: "${rmspace:${system.prompt_processor.prompt},_}"
 exp_root_dir: "outputs"
-seed: 3407
+seed: 0
 
 data_type: "random-camera-datamodule"
 data:
+  batch_size: 1
+  width: 256
+  height: 256
+  camera_distance_range: [1.0, 1.5]
+  fovy_range: [40, 70]
   elevation_range: [-10, 45]
+  camera_perturb: 0.
+  center_perturb: 0.
+  up_perturb: 0.
+  eval_camera_distance: 1.5
+  eval_fovy_deg: 70.
 
-system_type: "latentnerf-system"
+system_type: "dreamfusion-system"
 system:
-  geometry_type: "implicit-volume"
+  geometry_type: "multiscale_triplane"
   geometry:
-    n_feature_dims: 4
-    normal_type: null
+    radius: 1.0
+    normal_type: "finite_difference"
 
-    density_bias: "blob_dreamfusion"
-    density_activation: trunc_exp
-    density_blob_scale: 5.
-    density_blob_std: 0.2
+    density_bias: "blob_magic3d"
+    density_activation: softplus
+    density_blob_scale: 10.
+    density_blob_std: 0.5
+
+    pos_encoding_config:
+      otype: multiscale_triplane
 
   material_type: "no-material"
   material:
-    n_output_dims: 4
-    color_activation: none
+    n_output_dims: 3
+    color_activation: sigmoid
 
   background_type: "neural-environment-map-background"
   background:
-    n_output_dims: 4
-    color_activation: none
+    color_activation: sigmoid
+    random_aug: true
 
   renderer_type: "nerf-volume-renderer"
   renderer:
+    radius: ${system.geometry.radius}
     num_samples_per_ray: 512
 
   prompt_processor_type: "stable-diffusion-prompt-processor"
@@ -43,6 +57,10 @@ system:
     pretrained_model_name_or_path: "stabilityai/stable-diffusion-2-1-base"
     guidance_scale: 100.
     weighting_strategy: sds
+    min_step_percent: 0.3
+    max_step_percent: 0.98
+    sqrt_anneal: true
+    use_img_loss: true
 
   loggers:
     wandb:
@@ -52,9 +70,11 @@ system:
 
   loss:
     lambda_sds: 1.
-    lambda_sparsity: 5.e-4
-    lambda_opaque: 0.0
-    lambda_orient: 0.0
+    lambda_sds_img: 0.01
+    lambda_orient: 0.
+    lambda_sparsity: 1.
+    lambda_opaque: 0.
+    lambda_z_variance: 100
 
   optimizer:
     name: Adam
@@ -62,24 +82,18 @@ system:
       lr: 0.01
       betas: [0.9, 0.99]
       eps: 1.e-15
-  scheduler:
-    name: SequentialLR
-    interval: step
-    warmup_steps: 100
-    milestones:
-      - ${system.scheduler.warmup_steps}
-    schedulers:
-      - name: LinearLR # linear warm-up in the first system.warmup_steps steps
-        args:
-          start_factor: 0.1
-          end_factor: 1.0
-          total_iters: ${system.scheduler.warmup_steps}
-      - name: ExponentialLR
-        args:
-          gamma: ${calc_exp_lr_decay_rate:0.1,${sub:${trainer.max_steps},${system.scheduler.warmup_steps}}}
+    params:
+      geometry.encoding:
+        lr: 0.01
+      geometry.density_network:
+        lr: 0.001
+      geometry.feature_network:
+        lr: 0.001
+      background:
+        lr: 0.001
 
 trainer:
-  max_steps: 6000
+  max_steps: 25000
   log_every_n_steps: 1
   num_sanity_val_steps: 0
   val_check_interval: 200

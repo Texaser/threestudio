@@ -14,6 +14,7 @@ from threestudio.models.geometry.base import (
 )
 from threestudio.models.geometry.implicit_sdf import ImplicitSDF
 from threestudio.models.geometry.implicit_volume import ImplicitVolume
+from threestudio.models.geometry.multiscale_triplane import MultiscaleTriplane
 from threestudio.models.isosurface import MarchingTetrahedraHelper
 from threestudio.models.mesh import Mesh
 from threestudio.models.networks import get_encoding, get_mlp
@@ -295,6 +296,29 @@ class TetrahedraSDFGrid(BaseExplicitGeometry):
                 )
             return instance
         elif isinstance(other, ImplicitVolume):
+            instance = TetrahedraSDFGrid(cfg, **kwargs)
+            if other.cfg.isosurface_method != "mt":
+                other.cfg.isosurface_method = "mt"
+                threestudio.warn(
+                    f"Override isosurface_method of the source geometry to 'mt'"
+                )
+            if other.cfg.isosurface_resolution != instance.cfg.isosurface_resolution:
+                other.cfg.isosurface_resolution = instance.cfg.isosurface_resolution
+                threestudio.warn(
+                    f"Override isosurface_resolution of the source geometry to {instance.cfg.isosurface_resolution}"
+                )
+            mesh = other.isosurface()
+            instance.isosurface_bbox = mesh.extras["bbox"]
+            instance.sdf.data = (
+                mesh.extras["grid_level"].to(instance.sdf.data).clamp(-1, 1)
+            )
+            if not instance.cfg.geometry_only and copy_net:
+                instance.encoding.load_state_dict(other.encoding.state_dict())
+                instance.feature_network.load_state_dict(
+                    other.feature_network.state_dict()
+                )
+            return instance
+        elif isinstance(other, MultiscaleTriplane):
             instance = TetrahedraSDFGrid(cfg, **kwargs)
             if other.cfg.isosurface_method != "mt":
                 other.cfg.isosurface_method = "mt"

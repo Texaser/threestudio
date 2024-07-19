@@ -13,7 +13,7 @@ class NVDiffRasterizerContext:
         self, context_type: str, device: torch.device
     ) -> Union[dr.RasterizeGLContext, dr.RasterizeCudaContext]:
         if context_type == "gl":
-            return dr.RasterizeGLContext(device=device)
+            return dr.RasterizeCudaContext(device=device)
         elif context_type == "cuda":
             return dr.RasterizeCudaContext(device=device)
         else:

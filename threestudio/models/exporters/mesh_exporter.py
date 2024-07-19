@@ -18,7 +18,7 @@ from threestudio.utils.typing import *
 class MeshExporter(Exporter):
     @dataclass
     class Config(Exporter.Config):
-        fmt: str = "obj-mtl"  # in ['obj-mtl', 'obj'], TODO: fbx
+        fmt: str = "obj"  # in ['obj-mtl', 'obj'], TODO: fbx
         save_name: str = "model"
         save_normal: bool = False
         save_uv: bool = True

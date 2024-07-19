@@ -4,14 +4,13 @@ import tinycudann as tcnn
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+import math
 import threestudio
 from threestudio.utils.base import Updateable
 from threestudio.utils.config import config_to_primitive
 from threestudio.utils.misc import get_rank
 from threestudio.utils.ops import get_activation
 from threestudio.utils.typing import *
-
 
 class ProgressiveBandFrequency(nn.Module, Updateable):
     def __init__(self, in_channels: int, config: dict):
@@ -59,7 +58,6 @@ class TCNNEncoding(nn.Module):
         with torch.cuda.device(get_rank()):
             self.encoding = tcnn.Encoding(in_channels, config, dtype=dtype)
         self.n_output_dims = self.encoding.n_output_dims
-
     def forward(self, x):
         return self.encoding(x)
 
@@ -126,6 +124,159 @@ class TCNNEncodingSpatialTime(nn.Module):
         return enc
 
 
+class FourierFeatureTransform(nn.Module):
+    def __init__(self, num_input_channels, mapping_size, initial_scale=1, dtype=torch.float32):
+        super().__init__()
+        self._num_input_channels = num_input_channels
+        self._mapping_size = mapping_size
+        self._B = nn.Parameter(torch.randn((num_input_channels, mapping_size), dtype=dtype) * initial_scale, requires_grad=False)
+    def forward(self, x):
+        with torch.cuda.amp.autocast(enabled=False):
+            x = x @ self._B * 2 * torch.tensor(math.pi, dtype=x.dtype, device=x.device)
+        return torch.cat([torch.sin(x), torch.cos(x)], dim=-1)
+
+
+class MultiScaleTriplane(nn.Module, Updateable):
+    def __init__(self, n_input_dims=3, n_scales=4, channel=32, grid_size=512, true_global_step=0, dtype=torch.float32):
+        super().__init__()
+        self.n_input_dims = n_input_dims
+        self.n_output_dims = channel * 4
+        # self.n_output_dims = channel
+        self.n_scales = n_scales
+        self.iteration = 0
+        self.vector_1 = nn.ParameterList([nn.Parameter(torch.randn(1, channel, grid_size, 1, dtype=dtype) * 1e-3) for _ in range(3)])
+        self.plane_2 = nn.ParameterList([nn.Parameter(torch.randn(1, channel, grid_size // 2, grid_size // 2, dtype=dtype) * 3e-4) for _ in range(3)])
+        self.plane_3 = nn.ParameterList([nn.Parameter(torch.randn(1, channel, grid_size // 4, grid_size // 4, dtype=dtype) * 1.5e-4) for _ in range(3)])
+        self.plane_4 = nn.ParameterList([nn.Parameter(torch.randn(1, channel, grid_size // 8, grid_size // 8, dtype=dtype) * 7.5e-5) for _ in range(3)])
+        self.net1 = nn.Sequential(
+            # FourierFeatureTransform(channel, channel // 2, initial_scale=0.0075),
+            FourierFeatureTransform(channel * 4, channel * 2, initial_scale=0.0075),
+        )
+        self.plane_4_frozen, self.plane_3_frozen, self.plane_2_frozen = False, False, False
+    def sample_plane(self, coords2d, plane):
+        assert len(coords2d.shape) == 3, coords2d.shape
+        # coords2d = coords2d + torch.normal(mean=0, std=0.005, size=coords2d.shape).to(coords2d.device)
+        sampled_features = F.grid_sample(plane, coords2d.view(coords2d.shape[0], 1, -1, coords2d.shape[-1]),
+                                                           mode='bicubic', padding_mode='border', align_corners=True)
+        #mode bicubic padding_mode
+        N, C, H, W = sampled_features.shape
+        sampled_features = sampled_features.view(N, C, H*W).permute(0, 2, 1)
+        return sampled_features
+    
+    def sample_grid(self, coords3d, grid):
+        assert len(coords3d.shape) == 3, coords3d.shape
+        # coords3d = coords3d + torch.normal(mean=0, std=0.005, size=coords3d.shape).to(coords3d.device)
+        sampled_features = F.grid_sample(grid, coords3d.view(coords3d.shape[0], 1, -1, 1, coords3d.shape[-1]), 
+                                         mode='bicubic', padding_mode='border', align_corners=True)
+        N, C, _, H, W = sampled_features.shape
+        sampled_features = sampled_features.view(N, C, H*W).permute(0, 2, 1)
+        return sampled_features
+    
+    def sample_vector(self, coords1d, vector):
+        assert len(coords1d.shape) == 3, coords1d.shape
+        coords1d = torch.stack([-torch.ones_like(coords1d), coords1d], dim=-1)
+        # coords1d = coords1d + torch.normal(mean=0, std=0.005, size=coords1d.shape).to(coords1d.device)
+        sampled_features = F.grid_sample(vector, coords1d.view(coords1d.shape[0], 1, -1, coords1d.shape[-1]), 
+                                         mode='bicubic', padding_mode='border', align_corners=True)
+        N, C, H, W = sampled_features.shape
+        sampled_features = sampled_features.view(N, C, H*W).permute(0, 2, 1)
+
+        return sampled_features
+
+    def forward(self, coordinates, true_global_step=0):
+        coordinates = coordinates.unsqueeze(0)
+        # Update the iteration attribute
+        # if self.iteration in (4001, 6001, 8001):
+        #     self.update_freeze_status(self.iteration)
+        
+        feature1 = self.sample_plane(coordinates[..., 0:2], self.plane_3[0]) 
+        feature1.add_(self.sample_plane(coordinates[..., 1:3], self.plane_3[1])) 
+        feature1.add_(self.sample_plane(coordinates[..., :3:2], self.plane_3[2]))                 
+
+        feature2 = self.sample_plane(coordinates[..., 0:2], self.plane_3[0]) 
+        feature2.add_(self.sample_plane(coordinates[..., 1:3], self.plane_3[1]))
+        feature2.add_(self.sample_plane(coordinates[..., :3:2], self.plane_3[2]))  
+
+        feature3 = self.sample_plane(coordinates[..., 0:2], self.plane_2[0]) 
+        feature3.add_(self.sample_plane(coordinates[..., 1:3], self.plane_2[1])) 
+        feature3.add_(self.sample_plane(coordinates[..., :3:2], self.plane_2[2]))  
+
+        feature4 = self.sample_vector(coordinates[..., 0:1], self.vector_1[0])
+        feature4.add_(self.sample_vector(coordinates[..., 1:2], self.vector_1[1]))
+        feature4.add_(self.sample_vector(coordinates[..., 2:3], self.vector_1[2]))
+
+        feature = torch.cat([feature1, feature2, feature3, feature4], dim=-1)
+        del feature1, feature2, feature3, feature4
+        # if self.iteration > 4000:
+        #     feature2 = self.sample_plane(coordinates[..., 0:2], self.plane_3[0]) 
+        #     feature2.add_(self.sample_plane(coordinates[..., 1:3], self.plane_3[1]))
+        #     feature2.add_(self.sample_plane(coordinates[..., :3:2], self.plane_3[2]))  
+
+        # if self.iteration > 6000:
+        #     feature3 = self.sample_plane(coordinates[..., 0:2], self.plane_2[0]) 
+        #     feature3.add_(self.sample_plane(coordinates[..., 1:3], self.plane_2[1])) 
+        #     feature3.add_(self.sample_plane(coordinates[..., :3:2], self.plane_2[2]))  
+
+        # if self.iteration > 8000:
+        #     feature4 = self.sample_vector(coordinates[..., 0:1], self.vector_1[0])
+        #     feature4.add_(self.sample_vector(coordinates[..., 1:2], self.vector_1[1]))
+        #     feature4.add_(self.sample_vector(coordinates[..., 2:3], self.vector_1[2]))
+
+        # if self.iteration > 8000:
+        #     feature = feature1 + feature2 * 0.7 + feature3 * 0.5 + feature4 * 0.3
+        #     del feature1, feature2, feature3, feature4
+        # elif self.iteration > 6000:
+        #     feature = feature1 + feature2 * 0.7 + feature3 * 0.5
+        #     del feature1, feature2, feature3
+        # elif self.iteration > 4000:
+        #     feature = feature1 + feature2 * 0.7
+        #     del feature1, feature2
+        # else:
+        #     feature = feature1
+        #     del feature1
+
+        # if self.iteration > 8000:
+        #     feature1 *= 0.3
+        #     feature2 *= 0.5
+        #     feature3 *= 0.7
+        #     feature = feature1 + feature2 + feature3 + feature4
+        #     del feature1, feature2, feature3, feature4
+        # elif self.iteration > 6000:
+        #     feature1 *= 0.5
+        #     feature2 *= 0.7
+        #     feature = feature1 + feature2 + feature3
+        #     del feature1, feature2, feature3
+        # if self.iteration > 4000:
+        #     feature1 *= 0.7
+        #     feature = feature1 + feature2
+        #     del feature1, feature2
+        # else:
+        #     feature = feature1
+        #     del feature1
+
+        return self.net1(feature[0])
+
+    
+    def update_freeze_status(self, current_iteration):
+
+        if self.iteration > 4000 and not self.plane_4_frozen:
+            for p in self.plane_4.parameters():
+                p.requires_grad_(False)
+            self.plane_4_frozen = True
+
+        if self.iteration > 6000 and not self.plane_3_frozen:
+            for p in self.plane_3.parameters():
+                p.requires_grad_(False)
+            self.plane_3_frozen = True
+
+
+        if self.iteration > 8000 and not self.plane_2_frozen:
+            for p in self.plane_2.parameters():
+                p.requires_grad_(False)
+            self.plane_2_frozen = True
+
+    def update_step(self, epoch, global_step, on_load_weights=False):
+        self.iteration = global_step
 class ProgressiveBandHashGrid(nn.Module, Updateable):
     def __init__(self, in_channels, config, dtype=torch.float32):
         super().__init__()
@@ -200,6 +351,9 @@ def get_encoding(n_input_dims: int, config) -> nn.Module:
         encoding = ProgressiveBandHashGrid(n_input_dims, config_to_primitive(config))
     elif config.otype == "HashGridSpatialTime":
         encoding = TCNNEncodingSpatialTime(n_input_dims, config)  # 4D-fy encoding
+    elif config.otype == "multiscale_triplane":
+        encoding = MultiScaleTriplane(n_input_dims)
+        # encoding = TCNNEncodingSpatialTime(n_input_dims, config)
     else:
         encoding = TCNNEncoding(n_input_dims, config_to_primitive(config))
     encoding = CompositeEncoding(

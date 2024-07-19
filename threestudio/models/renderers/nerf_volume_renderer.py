@@ -111,7 +111,7 @@ class NeRFVolumeRenderer(VolumeRenderer):
             raise NotImplementedError(
                 "Unknown estimator, should be one of ['occgrid', 'proposal', 'importance']."
             )
-
+        # self.true_global_step = 0
         # for proposal
         self.vars_in_forward = {}
 
@@ -121,6 +121,7 @@ class NeRFVolumeRenderer(VolumeRenderer):
         rays_d: Float[Tensor, "B H W 3"],
         light_positions: Float[Tensor, "B 3"],
         bg_color: Optional[Tensor] = None,
+        # true_global_step = None,
         **kwargs
     ) -> Dict[str, Float[Tensor, "..."]]:
         batch_size, height, width = rays_o.shape[:3]
@@ -132,7 +133,7 @@ class NeRFVolumeRenderer(VolumeRenderer):
             .reshape(-1, 3)
         )
         n_rays = rays_o_flatten.shape[0]
-
+        # self.true_global_step = true_global_step
         if self.cfg.estimator == "occgrid":
             if not self.cfg.grid_prune:
                 with torch.no_grad():
